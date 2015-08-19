@@ -10,7 +10,7 @@ household <- 1 # 1= male, 2= female, 3=couple
 rage <- 65 # retirement age
 n <- 1000
 mu <- .05
-sigma <- .11
+sigma <- .1100
 rage <- 65
 portfolio <- 1000000 # $1,000000
 yrs <- 50 # years of market returns

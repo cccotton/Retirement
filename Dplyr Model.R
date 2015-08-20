@@ -1,93 +1,178 @@
+cat("\014")
+#Dplyr approach - Cary
 
-
-randomz <- FALSE # If TRUE, generate a new set of random market returns. If FALSE, input canned random returns from file
-
-
-# Set initial values
-
-# set.seed(27514)
-household <- 1 # 1= male, 2= female, 3=couple 
-rage <- 65 # retirement age
-n <- 1000
-mu <- .05
-sigma <- .11
-rage <- 65
-portfolio <- 1000000 # $1,000000
-yrs <- 50 # years of market returns
-wr = .05 # percentage of initial portfolio value to spend annually
-spend <- wr * portfolio # dollar amount to spend annually
-balances <- matrix(nrow=n,ncol=yrs)
-ageRuined <- rep(n,0)
-events <- rep(n,0)
-censor <- rep ()
-
-# functions
-
-newBalance <- function (lastYearBal,currentReturn,spend) { max(0,(lastYearBal - spend) * currentReturn) }
-
-# Create table of n rows and yrs = 50 columns of random market returns
-
-if (randomz) {
-  marketReturns <- matrix(rlnorm(n*yrs,mu,sigma), n, yrs)
-} else {
-  marketReturns <- read.csv("Random Market Returns Log-N 10Kx50.csv",header = FALSE)
+#Functions
+summaryFailureYear <- function (x) {
+  balance <- portfolio
+  
+  runningbalance <- vector(mode = "numeric", length = 0)
+  
+  for (k in 1:50) {
+    balance <- (balance - spending) * x[k]
+    runningbalance[k] <- balance
+    if (balance < 0) break
+  }
+  if(k == 50) k <- 99
+  return(k)
 }
 
-# Create a vector "ageDied" of n random life expectancies from SOC Mortality Tables
+simrun <- function (seed.init, index) {
+  set.seed(seed.init)
+  simulation <- tbl_df(data.frame(cohort.member = as.numeric(seq(1, 1000)))) %>%
+    bind_cols(sample_n(cleanedlifeSpanJoint, 1000, replace = TRUE)) %>%
+    mutate(series = sample(1:10000, 1000, replace=T)) %>%
+    left_join(solvedMarketScenarios, by = "series") %>%
+    mutate(event.year = pmin(death.years, failure.year),
+           event.type = ifelse(failure.year < death.years, 1, 0)) %>%
+    select(series, event.year, event.type)
+  
+  simtimes <- tbl_df(data.frame(time = as.numeric(seq(65, 115))))
+  
+  sfit <- survfit(Surv(as.numeric(simulation$event.year), simulation$event.type) ~ 1)
+  sfit.tdf <- tbl_df(data.frame(time = as.numeric(sfit$time), surv = sfit$surv))
+  
+  crtp <- timepoints(cuminc(as.numeric(simulation$event.year), simulation$event.type, cencode = 2), seq(65, 115))$est
+  
+  crfit.tdf <- tbl_df(data.frame(index, time = seq(65, 115), cideath = crtp[2,], cifailure = crtp[1,]))
+  
+  simresults <- simtimes %>%
+    left_join(sfit.tdf, by = "time") %>%
+    left_join(crfit.tdf, by = "time") %>%
+    mutate(surv = ifelse(time == 65, 1, surv),
+           surv = ifelse(is.na(surv), 99, surv),
+           cideath = cummax(cideath),
+           cifailure = cummax(cifailure),
+           surv = cummin(surv),
+           time = as.numeric(time))
+  return(simresults)
+}
 
-if (household == 1) soc <- read.csv("Male Random Lifetimes from Age 65.csv",header=FALSE,nrows=n)
-if (household == 2) soc <- read.csv("Female Random Lifetimes from Age 65.csv",header=FALSE,nrows=n)
-if (household == 3) soc <- read.csv("Joint Random Lifetimes from Age 65.csv",header=FALSE,nrows=n)
-ageDied <- soc[,1]
+##Libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(survival)
+library(cmprsk)
 
-# ageDied <- 95 # add this line to get fixed-lifetime Bengen model results. Check the correct column of balances
-# for terminal portfolio values. (Column 30 for age 95, for example)
+##Files and formatting
+marketReturns <- read.csv("Random Market Returns Log-N 10Kx50.csv",header = FALSE)
+lifeSpanMale <- read.csv("Male Random Lifetimes from Age 65.csv",header=FALSE)
+lifeSpanFemale <- read.csv("Female Random Lifetimes from Age 65.csv",header=FALSE)
+lifeSpanJoint <- read.csv("Joint Random Lifetimes from Age 65.csv",header=FALSE)
 
-# Create 50 columns of n rows of portfolio balances based on the market returns matrix and annual spending of wr % of initial portfolio balance
+#marketReturns
+marketReturns.tdf <- tbl_df(marketReturns) %>%
+  mutate(series = row_number())
+cleanedMarketReturns <- marketReturns.tdf %>%
+  gather(year, return.annual, -series, convert = T) %>%
+  mutate(year = as.numeric(sub("V", "", year))) %>%
+  arrange(series, year) %>%
+  group_by(series)
+cleanedMarketReturns
+
+#lifeSpanMale
+lifeSpanMale.tdf <- tbl_df(lifeSpanMale)
+
+cleanedlifeSpanMale <- lifeSpanMale.tdf %>%
+  rename(death.years = V1)
+cleanedlifeSpanMale
+
+#lifeSpanFemale
+lifeSpanFemale.tdf <- tbl_df(lifeSpanFemale)
+
+cleanedlifeSpanFemale <- lifeSpanFemale.tdf %>%
+  rename(death.years = V1)
+cleanedlifeSpanFemale
+
+#lifeSpanJoint
+lifeSpanJoint.tdf <- tbl_df(lifeSpanJoint)
+
+cleanedlifeSpanJoint <- lifeSpanJoint.tdf %>%
+  rename(death.years = V1)
+cleanedlifeSpanJoint
+
+##Plotting distributions
+weight.inverse <- 1 / (max(cleanedMarketReturns$series) * max(cleanedMarketReturns$year))
+ggplot(data = cleanedMarketReturns, aes(x = return.annual)) +
+  geom_bar(aes(weight = weight.inverse)) +
+  scale_y_continuous(labels = percent) +
+  xlab("Rate of annual returns") + ylab("Proportion of annual returns") +
+  theme_classic()
+
+weight.inverse <- 1 / 10000
+ggplot(data = cleanedlifeSpanMale, aes(x = death.years)) + ggtitle("Male") +
+  stat_bin(binwidth = 1, origin = 64.5, aes(weight = weight.inverse)) +
+  scale_y_continuous(labels = percent) +
+  xlab("Age at death") + ylab("Proportion of population samples") +
+  theme_classic()
+
+ggplot(data = cleanedlifeSpanFemale, aes(x = death.years)) +
+  stat_bin(binwidth = 1, origin = 64.5, aes(weight = weight.inverse)) +
+  scale_y_continuous(labels = percent) +
+  xlab("Age at death") + ylab("Proportion of population samples") + ggtitle("Female") +
+  theme_classic()
+
+ggplot(data = cleanedlifeSpanJoint, aes(x = death.years)) +
+  stat_bin(binwidth = 1, origin = 64.5, aes(weight = weight.inverse)) +
+  scale_y_continuous(labels = percent) +
+  xlab("Age at death") + ylab("Proportion of population samples") + ggtitle("Joint") +
+  theme_classic()
+
+##Parameters
+portfolio <- 1000000
+wr = 0.03 # percentage of initial portfolio value to spend annually
+spending <- wr * portfolio
+
+##Failure years (conditional on above parameters)
+solvedMarketScenarios <- cleanedMarketReturns %>%
+  summarise(failure.year = summaryFailureYear(return.annual) + 65)
+
+weight.inverse <- 1 / (max(solvedMarketScenarios$series))
+ggplot(data = solvedMarketScenarios, aes(x = failure.year)) +
+  geom_bar(aes(weight = weight.inverse)) +
+  scale_y_continuous(labels = percent) +
+  xlab("Year of Portfolio Failure") + ylab("Proportion of cases (%)") +
+  theme_classic()
+
+##Run a single interation of the simulation
+simrun(1, 1)
+
+##Run an indexed set of iterations of the simulation
+sim.length <- length(seq(65, 115))
+first.seed <- 114
+n <- 100
+index <- seq(1, n)
+sims <- vector(mode = "list", length = n)
 
 for (i in 1:n) {
-  for (j in 1:yrs) {
-    if (j == 1) {oldBalance <- portfolio} 
-    else {oldBalance <- balances[i,j-1]}
-    
-    balances[i,j] <- newBalance(oldBalance,marketReturns[i,j],spend)
-  }
+  seed = 114 + i
+  sims[[i]] <- simrun(seed.init = seed, index = i)
 }
 
-# Create an "ageRuined" vector showing the age at which the portfolio balance no longer exceeded zero (was depleted)
+simulation.set <- bind_rows(sims) %>%
+  select(-index) %>%
+  group_by(time) %>%
+  summarise_each(funs(mean, var))
 
-for (k in 1:n) {
-  if(balances[k,yrs] > 0) {
-    ageRuined[k] <- yrs + rage 
-    censor[k] <- 1
-  } else {
-    ageRuined[k] <- min(which(balances[k,] <= 0)) + rage
-    censor[k] <- 0
-  }
-  if (ageDied[k] > ageRuined[k]) events[k] <- ageRuined[k] else events[k] <- ageDied[k]
-}
+##Graph the mean curves with simulation standard error 95% CL
+ggplot(data = simulation.set, aes(x = time, y = surv_mean)) +
+  geom_ribbon(aes(ymin = (surv_mean - 1.96 * sqrt(surv_var)), ymax = (surv_mean + 1.96 * sqrt(surv_var))), alpha = 0.05) +
+  geom_path() +
+  xlab("Age") + ylab("Proportion 1000-Member Cohort Without Portfolio Failure") + xlim(65, 100) + ylim(0, 1) +
+  theme_classic()
 
-# Create a boolean vector "ruinBeforeDeath" that is TRUE if the portfolio was depleted before death
+crsim <- cbind(gather(select(simulation.set, time, cideath_mean, cifailure_mean), curve, mean, -time),
+           select(gather(select(simulation.set, time, cideath_var, cifailure_var), curve, var, -time), var))
 
-ruinBeforeDeath <- (ageRuined < ageDied)
+crsim$curve <- factor(crsim$curve, labels = c("Portfolio failure", "Death"))
 
-# Display results: vectors of events and censoring
-
-cat("Withdrawal rate= ",wr," Probability of Ruin= ",sum(ruinBeforeDeath)/n)
-
-# build event and censor vectors for analyses. If died first, event <- age died and censor <- 0 (censored). If ruined
-# first, event <- age when ruined and censor <- 1 (not censored). If died and ruined in the same year, that is a
-# successful funding of retirement, so censor
-
-status <- (ageDied > ageRuined) + 1
-censor <- ageRuined >= ageDied
-cmpdf <- data.frame(events,status,censor)
-write.csv(cmpdf,"Censor Data 5 percent.csv",row.names = FALSE)
-
-
-
-# Find Bengen 30-year fixed survival rate
-
-bengen30 <- balances[,30]
-print(paste("Bengen 30-year failure= ",sum(bengen30/n <= 0)/n))
-
+ggplot(data = crsim, aes(x = time, y = mean)) +
+  geom_path(aes(linetype = curve)) +
+  geom_ribbon(aes(ymin = (mean - 1.96 * sqrt(var)),
+                  ymax = (mean + 1.96 * sqrt(var)),
+                  linetype = curve),
+              alpha = 0.05) +
+  xlab("Age") + ylab("Proportion 1000-Member Cohort Specified Outcome") + xlim(65, 100) +
+  scale_linetype_discrete(name = "") +
+  theme_classic()

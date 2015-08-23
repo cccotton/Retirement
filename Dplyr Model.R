@@ -16,37 +16,6 @@ summaryFailureYear <- function (x) {
   return(k)
 }
 
-simrun <- function (seed.init, index) {
-  set.seed(seed.init)
-  simulation <- tbl_df(data.frame(cohort.member = as.numeric(seq(1, 1000)))) %>%
-    bind_cols(sample_n(cleanedlifeSpanJoint, 1000, replace = TRUE)) %>%
-    mutate(series = sample(1:10000, 1000, replace=T)) %>%
-    left_join(solvedMarketScenarios, by = "series") %>%
-    mutate(event.year = pmin(death.years, failure.year),
-           event.type = ifelse(failure.year < death.years, 1, 0)) %>%
-    select(series, event.year, event.type)
-  
-  simtimes <- tbl_df(data.frame(time = as.numeric(seq(65, 115))))
-  
-  sfit <- survfit(Surv(as.numeric(simulation$event.year), simulation$event.type) ~ 1)
-  sfit.tdf <- tbl_df(data.frame(time = as.numeric(sfit$time), surv = sfit$surv))
-  
-  crtp <- timepoints(cuminc(as.numeric(simulation$event.year), simulation$event.type, cencode = 2), seq(65, 115))$est
-  
-  crfit.tdf <- tbl_df(data.frame(index, time = seq(65, 115), cideath = crtp[2,], cifailure = crtp[1,]))
-  
-  simresults <- simtimes %>%
-    left_join(sfit.tdf, by = "time") %>%
-    left_join(crfit.tdf, by = "time") %>%
-    mutate(surv = ifelse(time == 65, 1, surv),
-           surv = ifelse(is.na(surv), 99, surv),
-           cideath = cummax(cideath),
-           cifailure = cummax(cifailure),
-           surv = cummin(surv),
-           time = as.numeric(time))
-  return(simresults)
-}
-
 ##Libraries
 library(dplyr)
 library(tidyr)
@@ -121,7 +90,7 @@ ggplot(data = cleanedlifeSpanJoint, aes(x = death.years)) +
 
 ##Parameters
 portfolio <- 1000000
-wr = 0.03 # percentage of initial portfolio value to spend annually
+wr = 0.05 # percentage of initial portfolio value to spend annually
 spending <- wr * portfolio
 
 ##Failure years (conditional on above parameters)
@@ -135,35 +104,81 @@ ggplot(data = solvedMarketScenarios, aes(x = failure.year)) +
   xlab("Year of Portfolio Failure") + ylab("Proportion of cases (%)") +
   theme_classic()
 
-##Run a single interation of the simulation
-simrun(1, 1)
+######Run an indexed set of n iterations of the simulation########
+n <- 5000
+#######Query the CI estimations from year.start to year.end#######
+year.start <- 66
+year.end <- 100
+CISpan <- seq(year.start, year.end)
 
-##Run an indexed set of iterations of the simulation
-sim.length <- length(seq(65, 115))
-first.seed <- 114
-n <- 100
-index <- seq(1, n)
-sims <- vector(mode = "list", length = n)
+simulation <- tbl_df(data.frame(sim.index = as.numeric(rep(1:n, each=1000)), cohort.member = rep(as.numeric(seq(1, 1000)), n))) %>%
+  bind_cols(sample_n(cleanedlifeSpanJoint, n * 1000, replace = T)) %>%
+  mutate(series = sample(1:10000, n * 1000, replace=T)) %>%
+  left_join(solvedMarketScenarios, by = "series") %>%
+  rowwise() %>%
+  mutate(event.year = pmin(death.years, failure.year),
+         event.type = ifelse(failure.year < death.years, 1, 0)) %>%
+  group_by(sim.index)
 
-for (i in 1:n) {
-  seed = 114 + i
-  sims[[i]] <- simrun(seed.init = seed, index = i)
-}
+times <- simulation %>%
+  do(time = as.vector(survfit(Surv(as.numeric(.$event.year), .$event.type) ~ 1)$time)) %>%
+  unnest(time)
 
-simulation.set <- bind_rows(sims) %>%
-  select(-index) %>%
+survivals <- simulation %>%
+  group_by(sim.index) %>%
+  do(surv = as.vector(survfit(Surv(as.numeric(.$event.year), .$event.type) ~ 1)$surv)) %>%
+  unnest(surv) %>%
+  rename(index2 = sim.index)
+
+combinedSurvResults <- times %>%
+  bind_cols(survivals) %>%
+  filter(index2 == sim.index)
+
+simwisemeans.surv <- combinedSurvResults %>%
   group_by(time) %>%
-  summarise_each(funs(mean, var))
+  summarise(smean = mean(surv, na.rm = T),
+            svar = var(surv, na.rm = T)) %>%
+  ungroup()
+
+cumulative.inc <- simulation %>%
+  do(cifailure = timepoints(cuminc(as.numeric(.$event.year), .$event.type, cencode = 2), CISpan)) %>%
+  mutate(cifunpack = cifailure[1]) %>%
+  select(-cifailure) %>%
+  do(sim.index = .$sim.index,
+     failure = .$cifunpack[1, ], 
+     death = .$cifunpack[2, ]) %>%
+  mutate(sim.index = as.integer(sim.index))
+
+failure <- cumulative.inc %>%
+  select(sim.index, failure) %>%
+  unnest(failure)
+
+death <- cumulative.inc %>%
+  select(sim.index, death) %>%
+  unnest(death) %>%
+  rename(index2 = sim.index)
+
+combinedCIResults <- failure %>%
+  bind_cols(death) %>%
+  filter(index2 == sim.index)
+
+simwisemeans.ci <- combinedCIResults %>%
+  mutate(time = rep(CISpan, n)) %>%
+  group_by(time) %>%
+  summarise(cifmean = mean(failure),
+            cidmean = mean(death),
+            cifvar = var(failure),
+            cidvar = var(death))
 
 ##Graph the mean curves with simulation standard error 95% CL
-ggplot(data = simulation.set, aes(x = time, y = surv_mean)) +
-  geom_ribbon(aes(ymin = (surv_mean - 1.96 * sqrt(surv_var)), ymax = (surv_mean + 1.96 * sqrt(surv_var))), alpha = 0.05) +
+ggplot(data = simwisemeans.surv, aes(x = time, y = smean)) +
+  geom_ribbon(aes(ymin = (smean - 1.96 * sqrt(svar)), ymax = (smean + 1.96 * sqrt(svar))), alpha = 0.5) +
   geom_path() +
   xlab("Age") + ylab("Proportion 1000-Member Cohort Without Portfolio Failure") + xlim(65, 100) + ylim(0, 1) +
   theme_classic()
 
-crsim <- cbind(gather(select(simulation.set, time, cideath_mean, cifailure_mean), curve, mean, -time),
-           select(gather(select(simulation.set, time, cideath_var, cifailure_var), curve, var, -time), var))
+crsim <- cbind(gather(select(simwisemeans.ci, time, cidmean, cifmean), curve, mean, -time),
+               select(gather(select(simwisemeans.ci, time, cidvar, cifvar), curve, var, -time), var))
 
 crsim$curve <- factor(crsim$curve, labels = c("Portfolio failure", "Death"))
 
